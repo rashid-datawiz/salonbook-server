@@ -6,8 +6,15 @@ import { betterAuth } from "better-auth";
 import { mongodbAdapter } from "better-auth/adapters/mongodb";
 import { toNodeHandler, fromNodeHeaders } from "better-auth/node";
 
+import jwt from "jsonwebtoken";
+
+
 const app = express();
 const port = process.env.PORT || 5001;
+
+
+const JWT_SECRET = process.env.JWT_SECRET || "fallback_secret_for_dev_only";
+const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "7d";
 
 // ============================================================================
 // 1. CORS CONFIGURATION
@@ -138,13 +145,102 @@ export const sanitizeUser = (user) => {
 };
 
 // ============================================================================
-// 5. BETTER AUTH ROUTES (MOUNTED BEFORE express.json())
+// 5. JWT & ROLE VERIFICATION MIDDLEWARES
+// ============================================================================
+export const verifyJWT = async (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization || "";
+    const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : null;
+
+    if (!token) {
+      return res.status(401).json({ message: "Unauthorized: missing JWT token." });
+    }
+
+    let decoded;
+    try {
+      decoded = jwt.verify(token, JWT_SECRET);
+    } catch {
+      return res.status(401).json({ message: "Unauthorized: invalid or expired token." });
+    }
+
+    const user = await usersCollection.findOne(buildUserIdFilter(decoded.userId));
+    if (!user) {
+      return res.status(401).json({ message: "Unauthorized: user not found." });
+    }
+
+    // Server-side enforcement: immediately reject blocked users
+    if (user.isBlocked) {
+      return res.status(403).json({
+        message: "Access denied: your account has been blocked by an administrator.",
+      });
+    }
+
+    req.user = sanitizeUser(user);
+    return next();
+  } catch (err) {
+    return next(err);
+  }
+};
+
+export const requireRole = (...roles) => (req, res, next) => {
+  if (!req.user || !roles.includes(req.user.role)) {
+    return res.status(403).json({
+      message: "Forbidden: insufficient role permissions.",
+    });
+  }
+  return next();
+};
+
+export const verifyAdmin = requireRole("admin");
+export const verifyCustomer = requireRole("customer");
+
+
+
+// ============================================================================
+// 6. BETTER AUTH ROUTES 
 // ============================================================================
 // Express 5 requires named wildcard syntax: {/*any} instead of *
 app.all("/api/auth{/*any}", toNodeHandler(auth));
 
 // Parse JSON body for all standard REST routes that follow
 app.use(express.json());
+
+// ============================================================================
+// 7. JWT TOKEN EXCHANGE ROUTE
+// ============================================================================
+app.post("/api/jwt", async (req, res, next) => {
+  try {
+    const sessionData = await auth.api.getSession({
+      headers: fromNodeHeaders(req.headers),
+    });
+
+    if (!sessionData?.user) {
+      return res.status(401).json({ message: "Unauthorized: no active Better Auth session." });
+    }
+
+    const dbUser = await usersCollection.findOne(buildUserIdFilter(sessionData.user.id));
+    if (!dbUser) {
+      return res.status(401).json({ message: "Unauthorized: user account not found." });
+    }
+
+    if (dbUser.isBlocked) {
+      return res.status(403).json({ message: "Access denied: your account is blocked." });
+    }
+
+    const safeUser = sanitizeUser(dbUser);
+    const token = jwt.sign(
+      { userId: safeUser._id, email: safeUser.email, role: safeUser.role },
+      JWT_SECRET,
+      { expiresIn: JWT_EXPIRES_IN }
+    );
+
+    return res.json({ token, user: safeUser });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+
 
 // ============================================================================
 // 6. HEALTH CHECK
