@@ -58,7 +58,7 @@ const connectedClient = await connectToMongoDB();
 const db = connectedClient.db("a9-salonbook");
 
 // Collections:
-export const usersCollection = db.collection("users");
+export const usersCollection = db.collection("user");
 export const servicesCollection = db.collection("services");
 export const appointmentsCollection = db.collection("appointments");
 export const transactionsCollection = db.collection("transactions");
@@ -96,7 +96,7 @@ export const auth = betterAuth({
         type: "string",
         required: false,
         defaultValue: "customer",
-        input: false, // Critical: Blocks public signup from assigning "admin" role
+        input: true, // Allows client account type selection (admin or customer) to be saved
       },
       isBlocked: {
         type: "boolean",
@@ -132,13 +132,15 @@ export const buildUserIdFilter = (id) => {
 
 export const sanitizeUser = (user) => {
   if (!user) return null;
+  const rawRole = (user.role || "").toLowerCase();
+  const normalizedRole = rawRole === "admin" ? "admin" : "customer";
   return {
     _id: String(user._id || user.id),
     name: user.name || "",
     email: user.email || "",
     image: user.image || "",
     phone: user.phone || "",
-    role: user.role || "customer",
+    role: normalizedRole,
     isBlocked: Boolean(user.isBlocked),
     createdAt: user.createdAt || null,
   };
@@ -163,7 +165,17 @@ export const verifyJWT = async (req, res, next) => {
       return res.status(401).json({ message: "Unauthorized: invalid or expired token." });
     }
 
-    const user = await usersCollection.findOne(buildUserIdFilter(decoded.userId));
+    let user = await usersCollection.findOne(buildUserIdFilter(decoded.userId));
+    if (!user) {
+      user = await db.collection("user").findOne(buildUserIdFilter(decoded.userId));
+    }
+    if (!user && decoded.email) {
+      user = await usersCollection.findOne({ email: String(decoded.email).trim().toLowerCase() });
+      if (!user) {
+        user = await db.collection("user").findOne({ email: String(decoded.email).trim().toLowerCase() });
+      }
+    }
+
     if (!user) {
       return res.status(401).json({ message: "Unauthorized: user not found." });
     }
@@ -192,7 +204,14 @@ export const requireRole = (...roles) => (req, res, next) => {
 };
 
 export const verifyAdmin = requireRole("admin");
-export const verifyCustomer = requireRole("customer");
+export const verifyCustomer = (req, res, next) => {
+  if (!req.user || req.user.role === "admin") {
+    return res.status(403).json({
+      message: "Forbidden: insufficient role permissions.",
+    });
+  }
+  return next();
+};
 
 
 
@@ -228,9 +247,15 @@ app.post("/api/jwt", async (req, res, next) => {
     let dbUser = null;
     if (lookupId) {
       dbUser = await usersCollection.findOne(buildUserIdFilter(lookupId));
+      if (!dbUser) {
+        dbUser = await db.collection("user").findOne(buildUserIdFilter(lookupId));
+      }
     }
     if (!dbUser && lookupEmail) {
       dbUser = await usersCollection.findOne({ email: String(lookupEmail).trim().toLowerCase() });
+      if (!dbUser) {
+        dbUser = await db.collection("user").findOne({ email: String(lookupEmail).trim().toLowerCase() });
+      }
     }
 
     if (!dbUser && lookupEmail) {
@@ -493,7 +518,167 @@ app.delete("/api/services/:id", verifyJWT, verifyAdmin, async (req, res, next) =
 });
 
 // ============================================================================
-// 10.CUSTOMER APPOINTMENTS ROUTES
+// 10. PROFILE & ADMIN USER MANAGEMENT ROUTES
+// ============================================================================
+
+// Authenticated: Get currently logged-in user profile
+app.get("/api/users/me", verifyJWT, (req, res) => {
+  return res.json({ user: req.user });
+});
+
+// Authenticated: Update own profile permitted fields (never role or blocked status)
+app.patch("/api/users/profile", verifyJWT, async (req, res, next) => {
+  try {
+    const { name, image, phone } = req.body;
+    const updates = {};
+
+    if (name !== undefined) {
+      if (!String(name).trim()) {
+        return res.status(400).json({ message: "Name cannot be empty." });
+      }
+      updates.name = String(name).trim();
+    }
+    if (image !== undefined) updates.image = String(image).trim();
+    if (phone !== undefined) updates.phone = String(phone).trim();
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ message: "No editable profile fields provided." });
+    }
+
+    updates.updatedAt = new Date();
+
+    const filter = buildUserIdFilter(req.user._id);
+    let updatedUser = await usersCollection.findOneAndUpdate(
+      filter,
+      { $set: updates },
+      { returnDocument: "after" }
+    );
+
+    // Sync to singular user collection if present
+    if (!updatedUser) {
+      updatedUser = await db.collection("user").findOneAndUpdate(
+        filter,
+        { $set: updates },
+        { returnDocument: "after" }
+      );
+    } else {
+      await db.collection("user").updateOne(filter, { $set: updates }).catch(() => {});
+    }
+
+    if (!updatedUser) {
+      return res.status(404).json({ message: "User not found." });
+    }
+
+    return res.json({
+      message: "Profile updated successfully.",
+      user: sanitizeUser(updatedUser),
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+// Admin Only: List all registered customers from both user collections
+app.get("/api/admin/users", verifyJWT, verifyAdmin, async (_req, res, next) => {
+  try {
+    const [cPlural, cSingular] = await Promise.all([
+      usersCollection.find({ role: { $ne: "admin" } }).sort({ createdAt: -1 }).toArray(),
+      db.collection("user").find({ role: { $ne: "admin" } }).sort({ createdAt: -1 }).toArray(),
+    ]);
+
+    const seenEmails = new Set();
+    const combined = [];
+    for (const u of [...cPlural, ...cSingular]) {
+      const email = String(u.email || "").toLowerCase().trim();
+      if (email && !seenEmails.has(email)) {
+        seenEmails.add(email);
+        combined.push(u);
+      }
+    }
+
+    const customersWithCounts = await Promise.all(
+      combined.map(async (u) => {
+        const uid = u._id || u.id;
+        const totalAppointments = await appointmentsCollection.countDocuments({
+          $or: [
+            { customerId: toObjectIdIfValid(uid) },
+            { customerId: String(uid) },
+          ],
+        });
+        return {
+          ...sanitizeUser(u),
+          totalAppointments,
+        };
+      })
+    );
+
+    return res.json({ users: customersWithCounts });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+// Admin Only: View customer details
+app.get("/api/admin/users/:id", verifyJWT, verifyAdmin, async (req, res, next) => {
+  try {
+    const filter = buildUserIdFilter(req.params.id);
+    let user = await usersCollection.findOne(filter);
+    if (!user) {
+      user = await db.collection("user").findOne(filter);
+    }
+
+    if (!user) {
+      return res.status(404).json({ message: "User not found." });
+    }
+
+    return res.json({ user: sanitizeUser(user) });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+// Admin Only: Block or unblock a customer
+app.patch("/api/admin/users/:id/block", verifyJWT, verifyAdmin, async (req, res, next) => {
+  try {
+    const { isBlocked } = req.body;
+    if (typeof isBlocked !== "boolean") {
+      return res.status(400).json({ message: "isBlocked must be a boolean (true or false)." });
+    }
+
+    const filter = buildUserIdFilter(req.params.id);
+    let target = await usersCollection.findOne(filter);
+    if (!target) {
+      target = await db.collection("user").findOne(filter);
+    }
+
+    if (!target) {
+      return res.status(404).json({ message: "User not found." });
+    }
+
+    // Security rule: Admin accounts cannot be blocked
+    if (target.role === "admin") {
+      return res.status(400).json({ message: "Admin accounts cannot be blocked." });
+    }
+
+    const updated = await usersCollection.findOneAndUpdate(
+      filter,
+      { $set: { isBlocked, updatedAt: new Date() } },
+      { returnDocument: "after" }
+    );
+    await db.collection("user").updateOne(filter, { $set: { isBlocked, updatedAt: new Date() } }).catch(() => {});
+
+    return res.json({
+      message: isBlocked ? "User blocked successfully." : "User unblocked successfully.",
+      user: sanitizeUser(updated || target),
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+
+// ============================================================================
+// 11.CUSTOMER APPOINTMENTS ROUTES
 // ============================================================================
 
 // Customer Only: Submit a new appointment request
@@ -627,7 +812,7 @@ app.get("/api/appointments/:id", verifyJWT, async (req, res, next) => {
         { $unwind: { path: "$service", preserveNullAndEmptyArrays: true } },
         {
           $lookup: {
-            from: "users",
+            from: "user",
             localField: "customerId",
             foreignField: "_id",
             as: "customer",
@@ -715,7 +900,7 @@ app.get("/api/admin/appointments", verifyJWT, verifyAdmin, async (req, res, next
         { $unwind: { path: "$service", preserveNullAndEmptyArrays: true } },
         {
           $lookup: {
-            from: "users",
+            from: "user",
             localField: "customerId",
             foreignField: "_id",
             as: "customer",
@@ -772,7 +957,7 @@ app.patch("/api/admin/appointments/:id/status", verifyJWT, verifyAdmin, async (r
 });
 
 // ============================================================================
-// 11. ADMIN APPOINTMENTS MANAGEMENT
+// 12. ADMIN APPOINTMENTS MANAGEMENT
 // ============================================================================
 
 // Admin Only: List all appointment requests across all customers
@@ -801,7 +986,7 @@ app.get("/api/admin/appointments", verifyJWT, verifyAdmin, async (req, res, next
         { $unwind: { path: "$service", preserveNullAndEmptyArrays: true } },
         {
           $lookup: {
-            from: "users",
+            from: "user",
             localField: "customerId",
             foreignField: "_id",
             as: "customer",
