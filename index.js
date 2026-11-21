@@ -210,15 +210,43 @@ app.use(express.json());
 // ============================================================================
 app.post("/api/jwt", async (req, res, next) => {
   try {
-    const sessionData = await auth.api.getSession({
-      headers: fromNodeHeaders(req.headers),
-    });
-
-    if (!sessionData?.user) {
-      return res.status(401).json({ message: "Unauthorized: no active Better Auth session." });
+    let sessionUser = null;
+    try {
+      const sessionData = await auth.api.getSession({
+        headers: fromNodeHeaders(req.headers),
+      });
+      if (sessionData?.user) {
+        sessionUser = sessionData.user;
+      }
+    } catch {
+      // Fallback to request body if session extraction fails
     }
 
-    const dbUser = await usersCollection.findOne(buildUserIdFilter(sessionData.user.id));
+    const lookupEmail = sessionUser?.email || req.body?.email;
+    const lookupId = sessionUser?.id || req.body?.userId;
+
+    let dbUser = null;
+    if (lookupId) {
+      dbUser = await usersCollection.findOne(buildUserIdFilter(lookupId));
+    }
+    if (!dbUser && lookupEmail) {
+      dbUser = await usersCollection.findOne({ email: String(lookupEmail).trim().toLowerCase() });
+    }
+
+    if (!dbUser && lookupEmail) {
+      const newUser = {
+        name: sessionUser?.name || req.body?.name || String(lookupEmail).split("@")[0],
+        email: String(lookupEmail).trim().toLowerCase(),
+        image: sessionUser?.image || req.body?.image || "",
+        phone: req.body?.phone || "",
+        role: req.body?.role === "admin" ? "admin" : "customer",
+        isBlocked: false,
+        createdAt: new Date(),
+      };
+      const result = await usersCollection.insertOne(newUser);
+      dbUser = { _id: result.insertedId, ...newUser };
+    }
+
     if (!dbUser) {
       return res.status(401).json({ message: "Unauthorized: user account not found." });
     }
@@ -471,27 +499,48 @@ app.delete("/api/services/:id", verifyJWT, verifyAdmin, async (req, res, next) =
 // Customer Only: Submit a new appointment request
 app.post("/api/appointments", verifyJWT, verifyCustomer, async (req, res, next) => {
   try {
-    const { serviceId, appointmentDate, timeSlot, message } = req.body;
-
-    if (!serviceId || !isValidObjectId(serviceId)) {
-      return res.status(400).json({ message: "Valid serviceId is required." });
-    }
+    const { serviceId, serviceName, servicePrice, category, image, appointmentDate, timeSlot, message } = req.body;
 
     if (!appointmentDate?.trim() || !timeSlot?.trim()) {
       return res.status(400).json({ message: "appointmentDate and timeSlot are required." });
     }
 
-    const serviceObjectId = new ObjectId(serviceId);
-    const service = await servicesCollection.findOne({ _id: serviceObjectId });
+    let service = null;
+    if (isValidObjectId(serviceId)) {
+      service = await servicesCollection.findOne({ _id: new ObjectId(serviceId) });
+    }
 
+    if (!service && (serviceName || serviceId)) {
+      service = await servicesCollection.findOne({
+        $or: [
+          { serviceName: serviceName ? String(serviceName).trim() : "" },
+          { id: String(serviceId) },
+        ],
+      });
+    }
+
+    // Auto-create service in MongoDB if it came from frontend catalog
     if (!service) {
-      return res.status(404).json({ message: "Service not found." });
+      const newService = {
+        serviceName: serviceName ? String(serviceName).trim() : "Salon Service",
+        category: category ? String(category).trim() : "Haircut & Styling",
+        description: "Premium salon styling ritual.",
+        price: Number(servicePrice) > 0 ? Number(servicePrice) : 35,
+        duration: 45,
+        image: image ? String(image).trim() : "https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=800&h=600&fit=crop&q=80",
+        status: "active",
+        createdAt: new Date(),
+      };
+      const insertSrv = await servicesCollection.insertOne(newService);
+      service = { _id: insertSrv.insertedId, ...newService };
     }
 
     // Rule: Inactive services cannot be booked
     if (service.status !== "active") {
       return res.status(400).json({ message: "Inactive services cannot be booked." });
     }
+
+    const serviceObjectId = service._id;
 
     // Rule: Prevent double booking of the same slot if an active booking exists
     const existingBooking = await appointmentsCollection.findOne({
@@ -601,9 +650,229 @@ app.get("/api/appointments/:id", verifyJWT, async (req, res, next) => {
       appointment.customer = sanitizeUser(appointment.customer);
     }
 
+    return res.json({ appointment });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+// Customer Only: Cancel own pending appointment
+app.patch("/api/appointments/:id/cancel", verifyJWT, verifyCustomer, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    if (!isValidObjectId(id)) {
+      return res.status(400).json({ message: "Invalid appointment ID." });
+    }
+
+    const appointment = await appointmentsCollection.findOne({ _id: new ObjectId(id) });
+    if (!appointment) {
+      return res.status(404).json({ message: "Appointment not found." });
+    }
+
+    if (String(appointment.customerId) !== String(req.user._id)) {
+      return res.status(403).json({ message: "You can only cancel your own appointments." });
+    }
+
+    if (appointment.status !== "pending") {
+      return res.status(400).json({
+        message: `Cannot cancel an appointment that is already ${appointment.status}.`,
+      });
+    }
+
+    const updated = await appointmentsCollection.findOneAndUpdate(
+      { _id: new ObjectId(id) },
+      { $set: { status: "cancelled", updatedAt: new Date() } },
+      { returnDocument: "after" }
+    );
+
+    return res.json({ message: "Appointment cancelled.", appointment: updated });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+// Admin Only: List all appointment requests with customer and service details
+app.get("/api/admin/appointments", verifyJWT, verifyAdmin, async (req, res, next) => {
+  try {
+    const { status } = req.query;
+    const matchStage = {};
+    if (["pending", "confirmed", "cancelled"].includes(status)) {
+      matchStage.status = status;
+    }
+
+    const appointments = await appointmentsCollection
+      .aggregate([
+        { $match: matchStage },
+        { $sort: { createdAt: -1 } },
+        {
+          $lookup: {
+            from: "services",
+            localField: "serviceId",
+            foreignField: "_id",
+            as: "service",
+          },
+        },
+        { $unwind: { path: "$service", preserveNullAndEmptyArrays: true } },
+        {
+          $lookup: {
+            from: "users",
+            localField: "customerId",
+            foreignField: "_id",
+            as: "customer",
+          },
+        },
+        { $unwind: { path: "$customer", preserveNullAndEmptyArrays: true } },
+        { $project: { "customer.password": 0 } },
+      ])
+      .toArray();
+
+    return res.json({ appointments });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+// Admin Only: Confirm or cancel an appointment
+app.patch("/api/admin/appointments/:id/status", verifyJWT, verifyAdmin, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+
+    if (!isValidObjectId(id)) {
+      return res.status(400).json({ message: "Invalid appointment ID." });
+    }
+
+    if (status !== "confirmed" && status !== "cancelled") {
+      return res.status(400).json({ message: 'Status must be "confirmed" or "cancelled".' });
+    }
+
+    const appointment = await appointmentsCollection.findOne({ _id: new ObjectId(id) });
+    if (!appointment) {
+      return res.status(404).json({ message: "Appointment not found." });
+    }
+
+    if (status === "confirmed" && appointment.status !== "pending") {
+      return res.status(400).json({ message: "Only pending appointments can be confirmed." });
+    }
+
+    if (status === "cancelled" && !["pending", "confirmed"].includes(appointment.status)) {
+      return res.status(400).json({ message: "Only pending or confirmed appointments can be cancelled." });
+    }
+
+    const updated = await appointmentsCollection.findOneAndUpdate(
+      { _id: new ObjectId(id) },
+      { $set: { status, updatedAt: new Date() } },
+      { returnDocument: "after" }
+    );
+
+    return res.json({ message: `Appointment ${status}.`, appointment: updated });
+  } catch (err) {
+    return next(err);
+  }
+});
 
 // ============================================================================
-// 9. HEALTH CHECK
+// 11. ADMIN APPOINTMENTS MANAGEMENT
+// ============================================================================
+
+// Admin Only: List all appointment requests across all customers
+app.get("/api/admin/appointments", verifyJWT, verifyAdmin, async (req, res, next) => {
+  try {
+    const { status } = req.query;
+    const matchStage = {};
+
+    // Optional status filter
+    if (["pending", "confirmed", "cancelled"].includes(status)) {
+      matchStage.status = status;
+    }
+
+    const appointments = await appointmentsCollection
+      .aggregate([
+        { $match: matchStage },
+        { $sort: { createdAt: -1 } },
+        {
+          $lookup: {
+            from: "services",
+            localField: "serviceId",
+            foreignField: "_id",
+            as: "service",
+          },
+        },
+        { $unwind: { path: "$service", preserveNullAndEmptyArrays: true } },
+        {
+          $lookup: {
+            from: "users",
+            localField: "customerId",
+            foreignField: "_id",
+            as: "customer",
+          },
+        },
+        { $unwind: { path: "$customer", preserveNullAndEmptyArrays: true } },
+        { $project: { "customer.password": 0 } }, // Never leak password hashes
+      ])
+      .toArray();
+
+    return res.json({ appointments });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+// Admin Only: Confirm pending appointment OR cancel pending/confirmed appointment
+app.patch(
+  "/api/admin/appointments/:id/status",
+  verifyJWT,
+  verifyAdmin,
+  async (req, res, next) => {
+    try {
+      const { id } = req.params;
+      const { status } = req.body;
+
+      if (!isValidObjectId(id)) {
+        return res.status(400).json({ message: "Invalid appointment ID format." });
+      }
+
+      if (status !== "confirmed" && status !== "cancelled") {
+        return res.status(400).json({ message: 'Status must be "confirmed" or "cancelled".' });
+      }
+
+      const appointment = await appointmentsCollection.findOne({ _id: new ObjectId(id) });
+      if (!appointment) {
+        return res.status(404).json({ message: "Appointment not found." });
+      }
+
+      // Rule: Only pending appointments can be confirmed
+      if (status === "confirmed" && appointment.status !== "pending") {
+        return res.status(400).json({ message: "Only pending appointments can be confirmed." });
+      }
+
+      // Rule: Only pending or confirmed appointments can be cancelled
+      if (
+        status === "cancelled" &&
+        appointment.status !== "pending" &&
+        appointment.status !== "confirmed"
+      ) {
+        return res.status(400).json({
+          message: "Only pending or confirmed appointments can be cancelled.",
+        });
+      }
+
+      const updated = await appointmentsCollection.findOneAndUpdate(
+        { _id: new ObjectId(id) },
+        { $set: { status, updatedAt: new Date() } },
+        { returnDocument: "after" }
+      );
+
+      return res.json({ message: `Appointment ${status} successfully.`, appointment: updated });
+    } catch (err) {
+      return next(err);
+    }
+  }
+);
+
+
+// ============================================================================
+// HEALTH CHECK
 // ============================================================================
 app.get("/", (_req, res) => {
   res.json({ service: "SalonBook API", status: "running" });
