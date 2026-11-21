@@ -240,17 +240,84 @@ app.post("/api/jwt", async (req, res, next) => {
   }
 });
 
+// ============================================================================
+// 8. SALON SERVICES ROUTES (PUBLIC BROWSE + DETAILS)
+// ============================================================================
 
+// Public: Browse active services with search, category filtering, price sorting, and optional limit
+app.get("/api/services", async (req, res, next) => {
+  try {
+    const { search, category, sort, limit } = req.query;
+    const query = { status: "active" }; // Only active services visible to public
+
+    // Case-insensitive service name search
+    if (search && typeof search === "string" && search.trim()) {
+      query.serviceName = { $regex: escapeRegex(search.trim()), $options: "i" };
+    }
+
+    // Category filter (handles "all" or specific category)
+    if (category && typeof category === "string" && category.trim() && category !== "all") {
+      query.category = { $regex: `^${escapeRegex(category.trim())}$`, $options: "i" };
+    }
+
+    // Price sorting & default newest first
+    let sortStage = { createdAt: -1 };
+    if (sort === "price_asc") sortStage = { price: 1 };
+    if (sort === "price_desc") sortStage = { price: -1 };
+
+    let cursor = servicesCollection.find(query).sort(sortStage);
+
+    // Optional limit (useful for the homepage "Featured 6 Services" requirement)
+    const parsedLimit = Number.parseInt(limit, 10);
+    if (Number.isInteger(parsedLimit) && parsedLimit > 0) {
+      cursor = cursor.limit(parsedLimit);
+    }
+
+    const services = await cursor.toArray();
+    return res.json({ services });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+// Public: Get all distinct active service categories for filter dropdowns
+app.get("/api/services/categories", async (_req, res, next) => {
+  try {
+    const categories = await servicesCollection.distinct("category", { status: "active" });
+    return res.json({ categories });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+// Protected: Service Details (/services/[id])
+app.get("/api/services/:id", verifyJWT, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    if (!isValidObjectId(id)) {
+      return res.status(400).json({ message: "Invalid service ID format." });
+    }
+
+    const service = await servicesCollection.findOne({ _id: new ObjectId(id) });
+    if (!service) {
+      return res.status(404).json({ message: "Service not found." });
+    }
+
+    return res.json({ service });
+  } catch (err) {
+    return next(err);
+  }
+});
 
 // ============================================================================
-// 6. HEALTH CHECK
+// 9. HEALTH CHECK
 // ============================================================================
 app.get("/", (_req, res) => {
   res.json({ service: "SalonBook API", status: "running" });
 });
 
 // ============================================================================
-// 7. START SERVER
+// 10. START SERVER
 // ============================================================================
 app.listen(port, () => {
   console.log(`Server is running on port ${port}`);
