@@ -8,6 +8,7 @@ import { toNodeHandler, fromNodeHeaders } from "better-auth/node";
 
 import jwt from "jsonwebtoken";
 
+import Stripe from "stripe";
 
 const app = express();
 const port = process.env.PORT || 5001;
@@ -15,6 +16,8 @@ const port = process.env.PORT || 5001;
 
 const JWT_SECRET = process.env.JWT_SECRET || "fallback_secret_for_dev_only";
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "7d";
+
+const stripe = new Stripe((process.env.STRIPE_SECRET_KEY || "").trim());
 
 // ============================================================================
 // 1. CORS CONFIGURATION
@@ -220,6 +223,76 @@ export const verifyCustomer = (req, res, next) => {
 // ============================================================================
 // Express 5 requires named wildcard syntax: {/*any} instead of *
 app.all("/api/auth{/*any}", toNodeHandler(auth));
+
+// ============================================================================
+// 6B. STRIPE WEBHOOK (RAW BUFFER FOR SIGNATURE VERIFICATION)
+// Must be mounted BEFORE express.json() to preserve raw payload
+// ============================================================================
+app.post(
+  "/api/payments/webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    const sig = req.headers["stripe-signature"];
+    const webhookSecret = (process.env.STRIPE_WEBHOOK_SECRET || "").trim();
+
+    let event;
+    try {
+      if (webhookSecret && sig) {
+        event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+      } else {
+        const bodyStr = Buffer.isBuffer(req.body) ? req.body.toString("utf8") : req.body;
+        event = typeof bodyStr === "string" ? JSON.parse(bodyStr) : bodyStr;
+      }
+    } catch (err) {
+      console.error("Stripe webhook signature error:", err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    // Process event: checkout.session.completed
+    if (event && event.type === "checkout.session.completed") {
+      const session = event.data.object;
+      const appointmentId = session.metadata?.appointmentId;
+      const customerId = session.metadata?.customerId;
+
+      if (appointmentId) {
+        const apptObjId = toObjectIdIfValid(appointmentId);
+
+        // 1. Mark appointment paid in MongoDB
+        await appointmentsCollection.updateOne(
+          { _id: apptObjId },
+          {
+            $set: {
+              paymentStatus: "paid",
+              stripeSessionId: session.id,
+              paidAt: new Date(),
+              updatedAt: new Date(),
+            },
+          }
+        );
+
+        // 2. Insert immutable financial record in transactions collection (idempotent upsert)
+        const amountTotal = (session.amount_total || 0) / 100;
+        await transactionsCollection.updateOne(
+          { stripeSessionId: session.id },
+          {
+            $setOnInsert: {
+              appointmentId: apptObjId,
+              customerId: toObjectIdIfValid(customerId),
+              amount: amountTotal,
+              currency: (session.currency || "usd").toUpperCase(),
+              stripeSessionId: session.id,
+              status: "paid",
+              createdAt: new Date(),
+            },
+          },
+          { upsert: true }
+        );
+      }
+    }
+
+    return res.json({ received: true });
+  }
+);
 
 // Parse JSON body for all standard REST routes that follow
 app.use(express.json());
@@ -956,6 +1029,9 @@ app.patch("/api/admin/appointments/:id/status", verifyJWT, verifyAdmin, async (r
   }
 });
 
+
+
+
 // ============================================================================
 // 12. ADMIN APPOINTMENTS MANAGEMENT
 // ============================================================================
@@ -1049,6 +1125,296 @@ app.patch(
       );
 
       return res.json({ message: `Appointment ${status} successfully.`, appointment: updated });
+    } catch (err) {
+      return next(err);
+    }
+  }
+);
+
+// ============================================================================
+// 13. STRIPE CHECKOUT & PAYMENTS
+// ============================================================================
+
+// Customer Only: Create Stripe Checkout Session for a confirmed unpaid appointment
+app.post(
+  "/api/payments/create-checkout-session",
+  verifyJWT,
+  verifyCustomer,
+  async (req, res, next) => {
+    try {
+      const { appointmentId } = req.body;
+      if (!appointmentId || !isValidObjectId(appointmentId)) {
+        return res.status(400).json({ message: "Valid appointmentId is required." });
+      }
+
+      const appointment = await appointmentsCollection.findOne({
+        _id: new ObjectId(appointmentId),
+      });
+
+      if (!appointment) {
+        return res.status(404).json({ message: "Appointment not found." });
+      }
+
+      // Rule: Customers can only pay for their own appointments
+      if (String(appointment.customerId) !== String(req.user._id)) {
+        return res.status(403).json({ message: "You can only pay for your own appointments." });
+      }
+
+      // Rule: Only confirmed appointments can be paid for
+      if (appointment.status !== "confirmed") {
+        return res.status(400).json({
+          message: "Only confirmed appointments can be paid for.",
+        });
+      }
+
+      // Rule: Prevent double payment
+      if (appointment.paymentStatus === "paid") {
+        return res.status(400).json({ message: "This appointment is already paid." });
+      }
+
+      const service = await servicesCollection.findOne({ _id: appointment.serviceId });
+      const primaryClientUrl = ALLOWED_ORIGINS[0] || "http://localhost:3000";
+
+      // Create Stripe Checkout Session
+      const session = await stripe.checkout.sessions.create({
+        mode: "payment",
+        payment_method_types: ["card"],
+        customer_email: req.user.email,
+        line_items: [
+          {
+            quantity: 1,
+            price_data: {
+              currency: "usd",
+              unit_amount: Math.round(Number(appointment.servicePrice) * 100), // Stripe expects cents
+              product_data: {
+                name: service?.serviceName || "Salon Appointment",
+                description: `Appointment on ${appointment.appointmentDate} at ${appointment.timeSlot}`,
+                images: service?.image ? [service.image] : undefined,
+              },
+            },
+          },
+        ],
+        metadata: {
+          appointmentId: String(appointment._id),
+          customerId: String(req.user._id),
+          serviceId: String(appointment.serviceId),
+        },
+        success_url: `${primaryClientUrl}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${primaryClientUrl}/payment/cancel?appointment_id=${appointment._id}`,
+      });
+
+      return res.json({ sessionId: session.id, url: session.url });
+    } catch (err) {
+      return next(err);
+    }
+  }
+);
+
+// Public / Authenticated: Verify checkout session upon return to /payment/success
+app.get("/api/payments/verify-session/:sessionId", async (req, res, next) => {
+  try {
+    const { sessionId } = req.params;
+    if (!sessionId) {
+      return res.status(400).json({ message: "Missing sessionId parameter." });
+    }
+
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    if (!session) {
+      return res.status(404).json({ message: "Stripe checkout session not found." });
+    }
+
+    const isPaid = session.payment_status === "paid";
+    const appointmentId = session.metadata?.appointmentId;
+    const customerId = session.metadata?.customerId;
+    const serviceId = session.metadata?.serviceId;
+
+    if (isPaid && appointmentId) {
+      const apptObjId = toObjectIdIfValid(appointmentId);
+
+      // 1. Mark appointment paid in MongoDB
+      await appointmentsCollection.updateOne(
+        { _id: apptObjId },
+        {
+          $set: {
+            paymentStatus: "paid",
+            stripeSessionId: session.id,
+            paidAt: new Date(),
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      // 2. Insert into transactions collection (idempotent upsert)
+      const amountTotal = (session.amount_total || 0) / 100;
+      await transactionsCollection.updateOne(
+        { stripeSessionId: session.id },
+        {
+          $setOnInsert: {
+            appointmentId: apptObjId,
+            customerId: toObjectIdIfValid(customerId),
+            amount: amountTotal,
+            currency: (session.currency || "usd").toUpperCase(),
+            stripeSessionId: session.id,
+            status: "paid",
+            createdAt: new Date(),
+          },
+        },
+        { upsert: true }
+      );
+    }
+
+    // Retrieve service information for receipt
+    let service = null;
+    if (serviceId) {
+      service = await servicesCollection.findOne({ _id: toObjectIdIfValid(serviceId) });
+    }
+
+    return res.json({
+      success: true,
+      isPaid,
+      sessionId: session.id,
+      amount: (session.amount_total || 0) / 100,
+      currency: (session.currency || "usd").toUpperCase(),
+      customerEmail: session.customer_details?.email || session.customer_email || "",
+      customerName: session.customer_details?.name || "Valued Guest",
+      appointmentId,
+      serviceName: service?.serviceName || "Salon Grooming Ritual",
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+// Admin Only: Fetch all transactions (Strictly Read-Only Financial Ledger)
+// Rule: Admin must not be able to modify payment records manually
+app.get(
+  "/api/admin/transactions",
+  verifyJWT,
+  verifyAdmin,
+  async (_req, res, next) => {
+    try {
+      const transactions = await transactionsCollection
+        .aggregate([
+          { $sort: { createdAt: -1 } },
+          {
+            $lookup: {
+              from: "appointments",
+              localField: "appointmentId",
+              foreignField: "_id",
+              as: "appointment",
+            },
+          },
+          { $unwind: { path: "$appointment", preserveNullAndEmptyArrays: true } },
+          {
+            $lookup: {
+              from: "user",
+              localField: "customerId",
+              foreignField: "_id",
+              as: "customerUser",
+            },
+          },
+          { $unwind: { path: "$customerUser", preserveNullAndEmptyArrays: true } },
+          {
+            $lookup: {
+              from: "services",
+              localField: "appointment.serviceId",
+              foreignField: "_id",
+              as: "service",
+            },
+          },
+          { $unwind: { path: "$service", preserveNullAndEmptyArrays: true } },
+        ])
+        .toArray();
+
+      const formatted = transactions.map((t) => {
+        const dateObj = t.createdAt ? new Date(t.createdAt) : new Date();
+        const formattedDate = dateObj.toLocaleDateString("en-US", {
+          year: "numeric",
+          month: "short",
+          day: "numeric",
+        });
+        const formattedTime = dateObj.toLocaleTimeString("en-US", {
+          hour: "2-digit",
+          minute: "2-digit",
+        });
+
+        return {
+          id: String(t._id),
+          appointmentId: String(t.appointmentId || ""),
+          customerId: String(t.customerId || ""),
+          customerName: t.customerUser?.name || t.appointment?.customerName || "Customer",
+          customerEmail: t.customerUser?.email || t.appointment?.customerEmail || "customer@salonbook.com",
+          customerImage: t.customerUser?.image || "",
+          serviceName: t.service?.serviceName || t.service?.name || t.appointment?.serviceName || "Salon Service",
+          serviceCategory: t.service?.category || t.appointment?.category || "Grooming",
+          serviceImage: t.service?.image || t.appointment?.image || "",
+          appointmentDate: t.appointment?.appointmentDate || "2026-11-25",
+          timeSlot: t.appointment?.timeSlot || "11:30 AM",
+          amount: Number(t.amount || 0),
+          currency: (t.currency || "USD").toUpperCase(),
+          stripeSessionId: t.stripeSessionId || "",
+          status: t.status === "paid" ? "Success" : t.status === "failed" ? "Failed" : "Success",
+          date: formattedDate,
+          timestamp: `${formattedDate} • ${formattedTime}`,
+          createdAt: t.createdAt || new Date(),
+        };
+      });
+
+      return res.json({ transactions: formatted });
+    } catch (err) {
+      return next(err);
+    }
+  }
+);
+
+// Customer Only: Fetch customer's own payment history
+app.get(
+  "/api/transactions/my",
+  verifyJWT,
+  verifyCustomer,
+  async (req, res, next) => {
+    try {
+      const userObjId = toObjectIdIfValid(req.user._id);
+
+      const transactions = await transactionsCollection
+        .aggregate([
+          { $match: { $or: [{ customerId: userObjId }, { customerId: String(req.user._id) }] } },
+          { $sort: { createdAt: -1 } },
+          {
+            $lookup: {
+              from: "appointments",
+              localField: "appointmentId",
+              foreignField: "_id",
+              as: "appointment",
+            },
+          },
+          { $unwind: { path: "$appointment", preserveNullAndEmptyArrays: true } },
+          {
+            $lookup: {
+              from: "services",
+              localField: "appointment.serviceId",
+              foreignField: "_id",
+              as: "service",
+            },
+          },
+          { $unwind: { path: "$service", preserveNullAndEmptyArrays: true } },
+        ])
+        .toArray();
+
+      const formatted = transactions.map((t) => ({
+        id: String(t._id),
+        appointmentId: String(t.appointmentId || ""),
+        serviceName: t.service?.serviceName || t.appointment?.serviceName || "Salon Service",
+        appointmentDate: t.appointment?.appointmentDate || "",
+        timeSlot: t.appointment?.timeSlot || "",
+        amount: Number(t.amount || 0),
+        currency: (t.currency || "USD").toUpperCase(),
+        stripeSessionId: t.stripeSessionId || "",
+        status: t.status === "paid" ? "Success" : t.status,
+        date: t.createdAt ? new Date(t.createdAt).toISOString().split("T")[0] : "",
+      }));
+
+      return res.json({ transactions: formatted });
     } catch (err) {
       return next(err);
     }
