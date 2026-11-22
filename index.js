@@ -1430,7 +1430,118 @@ app.get("/", (_req, res) => {
 });
 
 // ============================================================================
-// 10. START SERVER
+// 12. DASHBOARD OVERVIEW STATS (CUSTOMER & ADMIN ANALYTICS)
+// ============================================================================
+
+// Customer Only: Overview statistics for customer dashboard
+app.get(
+  "/api/dashboard/customer/stats",
+  verifyJWT,
+  verifyCustomer,
+  async (req, res, next) => {
+    try {
+      const userObjId = toObjectIdIfValid(req.user._id);
+      const customerFilter = {
+        $or: [{ customerId: userObjId }, { customerId: String(req.user._id) }],
+      };
+
+      const [
+        totalAppointments,
+        pendingAppointments,
+        confirmedAppointments,
+        cancelledAppointments,
+      ] = await Promise.all([
+        appointmentsCollection.countDocuments(customerFilter),
+        appointmentsCollection.countDocuments({ ...customerFilter, status: "pending" }),
+        appointmentsCollection.countDocuments({ ...customerFilter, status: "confirmed" }),
+        appointmentsCollection.countDocuments({ ...customerFilter, status: "cancelled" }),
+      ]);
+
+      return res.json({
+        totalAppointments,
+        pendingAppointments,
+        confirmedAppointments,
+        cancelledAppointments,
+      });
+    } catch (err) {
+      return next(err);
+    }
+  }
+);
+
+// Admin Only: Overview KPI statistics for admin dashboard
+app.get(
+  "/api/dashboard/admin/stats",
+  verifyJWT,
+  verifyAdmin,
+  async (_req, res, next) => {
+    try {
+      const [
+        totalRegisteredCustomers,
+        totalActiveServices,
+        totalAppointments,
+        pendingAppointments,
+        confirmedAppointments,
+        paymentSummary,
+      ] = await Promise.all([
+        usersCollection.countDocuments({ role: { $ne: "admin" } }),
+        servicesCollection.countDocuments({ status: "active" }),
+        appointmentsCollection.countDocuments({}),
+        appointmentsCollection.countDocuments({ status: "pending" }),
+        appointmentsCollection.countDocuments({ status: "confirmed" }),
+        transactionsCollection
+          .aggregate([
+            { $match: { status: "paid" } },
+            {
+              $group: {
+                _id: null,
+                totalSuccessfulPayments: { $sum: 1 },
+                totalRevenue: { $sum: "$amount" },
+              },
+            },
+          ])
+          .toArray(),
+      ]);
+
+      return res.json({
+        totalRegisteredCustomers,
+        totalActiveServices,
+        totalAppointments,
+        pendingAppointments,
+        confirmedAppointments,
+        totalSuccessfulPayments: paymentSummary[0]?.totalSuccessfulPayments || 0,
+        totalRevenue: paymentSummary[0]?.totalRevenue || 0,
+      });
+    } catch (err) {
+      return next(err);
+    }
+  }
+);
+
+// ============================================================================
+// 13. 404 NOT FOUND & GLOBAL ERROR HANDLERS
+// ============================================================================
+
+// 404 Fallback for unhandled routes
+app.use((req, res) => {
+  res.status(404).json({
+    message: `Route not found: ${req.method} ${req.originalUrl}`,
+  });
+});
+
+// Centralized Express error handler
+app.use((err, _req, res, _next) => {
+  console.error("Unhandled server error:", err);
+  if (err.message === "Not allowed by CORS") {
+    return res.status(403).json({ message: "CORS policy violation." });
+  }
+  return res.status(err.statusCode || err.status || 500).json({
+    message: err.message || "Internal server error.",
+  });
+});
+
+// ============================================================================
+// 14. START SERVER
 // ============================================================================
 app.listen(port, () => {
   console.log(`Server is running on port ${port}`);
