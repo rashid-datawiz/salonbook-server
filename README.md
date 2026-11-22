@@ -109,6 +109,5 @@ The server will start on port `5001`.
 
 ## 🔗 Project Links
 
-- **Live Application**: *[Live Deployment Link]*
-- **Client GitHub Repository**: *[Client Repository Link]*
-- **Server GitHub Repository**: *[Server Repository Link]*
+- **Live Application**: *https://salonbook-client-rose.vercel.app/*
+- **Client GitHub Repository**: *https://github.com/rashid-datawiz/salonbook-client*
