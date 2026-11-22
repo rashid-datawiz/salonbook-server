@@ -294,6 +294,102 @@ app.post(
   }
 );
 
+// ============================================================================
+// STRIPE WEBHOOK LISTENER (MOUNTED BEFORE express.json())
+// ============================================================================
+app.post(
+  ["/api/webhooks/stripe", "/api/payments/webhook"],
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    const signature = req.headers["stripe-signature"];
+    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+    if (!signature || !webhookSecret) {
+      return res.status(400).json({ message: "Missing Stripe webhook signature or secret." });
+    }
+
+    let event;
+    try {
+      // Cryptographically verify that the event genuinely originated from Stripe
+      event = stripe.webhooks.constructEvent(req.body, signature, webhookSecret);
+    } catch (err) {
+      console.error("Stripe webhook signature verification failed:", err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    try {
+      // 1. Handle Successful Checkout Payment
+      if (event.type === "checkout.session.completed") {
+        const session = event.data.object;
+        const appointmentId = session.metadata?.appointmentId;
+        const customerId = session.metadata?.customerId;
+
+        if (
+          appointmentId &&
+          isValidObjectId(appointmentId) &&
+          session.payment_status === "paid"
+        ) {
+          const appointmentObjectId = new ObjectId(appointmentId);
+
+          // Idempotency: Check if this checkout session was already recorded
+          const existingTx = await transactionsCollection.findOne({
+            stripeSessionId: session.id,
+          });
+
+          if (!existingTx) {
+            // Update appointment paymentStatus to 'paid'
+            await appointmentsCollection.updateOne(
+              { _id: appointmentObjectId },
+              { $set: { paymentStatus: "paid", updatedAt: new Date() } }
+            );
+
+            // Record immutable financial receipt in transactions collection
+            await transactionsCollection.insertOne({
+              appointmentId: appointmentObjectId,
+              customerId: toObjectIdIfValid(customerId),
+              amount: (session.amount_total || 0) / 100, // Convert cents to dollars
+              currency: (session.currency || "usd").toLowerCase(),
+              stripeSessionId: session.id,
+              status: "paid",
+              createdAt: new Date(),
+            });
+          }
+        }
+      } 
+      // 2. Handle Asynchronous Payment Failures
+      else if (event.type === "checkout.session.async_payment_failed") {
+        const session = event.data.object;
+        const appointmentId = session.metadata?.appointmentId;
+        const customerId = session.metadata?.customerId;
+
+        if (appointmentId && isValidObjectId(appointmentId)) {
+          const existingTx = await transactionsCollection.findOne({
+            stripeSessionId: session.id,
+          });
+          if (!existingTx) {
+            await transactionsCollection.insertOne({
+              appointmentId: new ObjectId(appointmentId),
+              customerId: toObjectIdIfValid(customerId),
+              amount: (session.amount_total || 0) / 100,
+              currency: (session.currency || "usd").toLowerCase(),
+              stripeSessionId: session.id,
+              status: "failed",
+              createdAt: new Date(),
+            });
+          }
+        }
+      }
+
+      // Acknowledge receipt of the webhook to Stripe
+      return res.status(200).json({ received: true });
+    } catch (err) {
+      console.error("Stripe webhook processing error:", err);
+      return res.status(500).json({ message: "Webhook handler failed." });
+    }
+  }
+);
+
+
 // Parse JSON body for all standard REST routes that follow
 app.use(express.json());
 
@@ -1430,118 +1526,7 @@ app.get("/", (_req, res) => {
 });
 
 // ============================================================================
-// 12. DASHBOARD OVERVIEW STATS (CUSTOMER & ADMIN ANALYTICS)
-// ============================================================================
-
-// Customer Only: Overview statistics for customer dashboard
-app.get(
-  "/api/dashboard/customer/stats",
-  verifyJWT,
-  verifyCustomer,
-  async (req, res, next) => {
-    try {
-      const userObjId = toObjectIdIfValid(req.user._id);
-      const customerFilter = {
-        $or: [{ customerId: userObjId }, { customerId: String(req.user._id) }],
-      };
-
-      const [
-        totalAppointments,
-        pendingAppointments,
-        confirmedAppointments,
-        cancelledAppointments,
-      ] = await Promise.all([
-        appointmentsCollection.countDocuments(customerFilter),
-        appointmentsCollection.countDocuments({ ...customerFilter, status: "pending" }),
-        appointmentsCollection.countDocuments({ ...customerFilter, status: "confirmed" }),
-        appointmentsCollection.countDocuments({ ...customerFilter, status: "cancelled" }),
-      ]);
-
-      return res.json({
-        totalAppointments,
-        pendingAppointments,
-        confirmedAppointments,
-        cancelledAppointments,
-      });
-    } catch (err) {
-      return next(err);
-    }
-  }
-);
-
-// Admin Only: Overview KPI statistics for admin dashboard
-app.get(
-  "/api/dashboard/admin/stats",
-  verifyJWT,
-  verifyAdmin,
-  async (_req, res, next) => {
-    try {
-      const [
-        totalRegisteredCustomers,
-        totalActiveServices,
-        totalAppointments,
-        pendingAppointments,
-        confirmedAppointments,
-        paymentSummary,
-      ] = await Promise.all([
-        usersCollection.countDocuments({ role: { $ne: "admin" } }),
-        servicesCollection.countDocuments({ status: "active" }),
-        appointmentsCollection.countDocuments({}),
-        appointmentsCollection.countDocuments({ status: "pending" }),
-        appointmentsCollection.countDocuments({ status: "confirmed" }),
-        transactionsCollection
-          .aggregate([
-            { $match: { status: "paid" } },
-            {
-              $group: {
-                _id: null,
-                totalSuccessfulPayments: { $sum: 1 },
-                totalRevenue: { $sum: "$amount" },
-              },
-            },
-          ])
-          .toArray(),
-      ]);
-
-      return res.json({
-        totalRegisteredCustomers,
-        totalActiveServices,
-        totalAppointments,
-        pendingAppointments,
-        confirmedAppointments,
-        totalSuccessfulPayments: paymentSummary[0]?.totalSuccessfulPayments || 0,
-        totalRevenue: paymentSummary[0]?.totalRevenue || 0,
-      });
-    } catch (err) {
-      return next(err);
-    }
-  }
-);
-
-// ============================================================================
-// 13. 404 NOT FOUND & GLOBAL ERROR HANDLERS
-// ============================================================================
-
-// 404 Fallback for unhandled routes
-app.use((req, res) => {
-  res.status(404).json({
-    message: `Route not found: ${req.method} ${req.originalUrl}`,
-  });
-});
-
-// Centralized Express error handler
-app.use((err, _req, res, _next) => {
-  console.error("Unhandled server error:", err);
-  if (err.message === "Not allowed by CORS") {
-    return res.status(403).json({ message: "CORS policy violation." });
-  }
-  return res.status(err.statusCode || err.status || 500).json({
-    message: err.message || "Internal server error.",
-  });
-});
-
-// ============================================================================
-// 14. START SERVER
+// 10. START SERVER
 // ============================================================================
 app.listen(port, () => {
   console.log(`Server is running on port ${port}`);
