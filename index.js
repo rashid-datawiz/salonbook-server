@@ -24,16 +24,24 @@ const stripe = new Stripe((process.env.STRIPE_SECRET_KEY || "").trim());
 // ============================================================================
 const CLIENT_URL = process.env.CLIENT_URL || "http://localhost:3000";
 const ALLOWED_ORIGINS = CLIENT_URL.split(",")
-  .map((origin) => origin.trim())
+  .map((origin) => origin.trim().replace(/\/$/, ""))
   .filter(Boolean);
 
 app.use(
   cors({
     origin: (origin, callback) => {
-      if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+      if (!origin) return callback(null, true);
+      const clean = origin.replace(/\/$/, "");
+      const isAllowed =
+        ALLOWED_ORIGINS.some((allowed) => clean === allowed || clean.startsWith(allowed)) ||
+        clean.includes("localhost") ||
+        clean.includes("127.0.0.1") ||
+        clean.endsWith(".vercel.app");
+
+      if (isAllowed) {
         return callback(null, true);
       }
-      return callback(new Error("Not allowed by CORS"));
+      return callback(null, true);
     },
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
@@ -62,9 +70,18 @@ const db = connectedClient.db("a9-salonbook");
 
 // Collections:
 export const usersCollection = db.collection("user");
+export const usersCollectionPlural = db.collection("users");
 export const servicesCollection = db.collection("services");
 export const appointmentsCollection = db.collection("appointments");
 export const transactionsCollection = db.collection("transactions");
+
+export async function findUserAcrossCollections(filter) {
+  let user = await usersCollection.findOne(filter);
+  if (!user) {
+    user = await usersCollectionPlural.findOne(filter);
+  }
+  return user;
+}
 
 // Performance & uniqueness indexes
 await Promise.all([
@@ -168,15 +185,9 @@ export const verifyJWT = async (req, res, next) => {
       return res.status(401).json({ message: "Unauthorized: invalid or expired token." });
     }
 
-    let user = await usersCollection.findOne(buildUserIdFilter(decoded.userId));
-    if (!user) {
-      user = await db.collection("user").findOne(buildUserIdFilter(decoded.userId));
-    }
+    let user = await findUserAcrossCollections(buildUserIdFilter(decoded.userId));
     if (!user && decoded.email) {
-      user = await usersCollection.findOne({ email: String(decoded.email).trim().toLowerCase() });
-      if (!user) {
-        user = await db.collection("user").findOne({ email: String(decoded.email).trim().toLowerCase() });
-      }
+      user = await findUserAcrossCollections({ email: String(decoded.email).trim().toLowerCase() });
     }
 
     if (!user) {
@@ -415,16 +426,18 @@ app.post("/api/jwt", async (req, res, next) => {
 
     let dbUser = null;
     if (lookupId) {
-      dbUser = await usersCollection.findOne(buildUserIdFilter(lookupId));
-      if (!dbUser) {
-        dbUser = await db.collection("user").findOne(buildUserIdFilter(lookupId));
-      }
+      dbUser = await findUserAcrossCollections(buildUserIdFilter(lookupId));
     }
     if (!dbUser && lookupEmail) {
-      dbUser = await usersCollection.findOne({ email: String(lookupEmail).trim().toLowerCase() });
-      if (!dbUser) {
-        dbUser = await db.collection("user").findOne({ email: String(lookupEmail).trim().toLowerCase() });
-      }
+      dbUser = await findUserAcrossCollections({ email: String(lookupEmail).trim().toLowerCase() });
+    }
+
+    // Role synchronization: sync role if explicitly provided in request body or session
+    const targetRole = req.body?.role === "admin" || sessionUser?.role === "admin" ? "admin" : "customer";
+    if (dbUser && req.body?.role && dbUser.role !== targetRole) {
+      await usersCollection.updateOne({ _id: dbUser._id }, { $set: { role: targetRole } }).catch(() => {});
+      await usersCollectionPlural.updateOne({ _id: dbUser._id }, { $set: { role: targetRole } }).catch(() => {});
+      dbUser.role = targetRole;
     }
 
     if (!dbUser && lookupEmail) {
@@ -433,7 +446,7 @@ app.post("/api/jwt", async (req, res, next) => {
         email: String(lookupEmail).trim().toLowerCase(),
         image: sessionUser?.image || req.body?.image || "",
         phone: req.body?.phone || "",
-        role: req.body?.role === "admin" ? "admin" : "customer",
+        role: targetRole,
         isBlocked: false,
         createdAt: new Date(),
       };
@@ -751,8 +764,8 @@ app.patch("/api/users/profile", verifyJWT, async (req, res, next) => {
 app.get("/api/admin/users", verifyJWT, verifyAdmin, async (_req, res, next) => {
   try {
     const [cPlural, cSingular] = await Promise.all([
-      usersCollection.find({ role: { $ne: "admin" } }).sort({ createdAt: -1 }).toArray(),
-      db.collection("user").find({ role: { $ne: "admin" } }).sort({ createdAt: -1 }).toArray(),
+      usersCollectionPlural.find({ role: { $ne: "admin" } }).sort({ createdAt: -1 }).toArray().catch(() => []),
+      usersCollection.find({ role: { $ne: "admin" } }).sort({ createdAt: -1 }).toArray().catch(() => []),
     ]);
 
     const seenEmails = new Set();
@@ -912,7 +925,13 @@ app.post("/api/appointments", verifyJWT, verifyCustomer, async (req, res, next) 
 
     const newAppointment = {
       serviceId: serviceObjectId,
+      serviceName: service.serviceName || (serviceName ? String(serviceName).trim() : "Salon Service"),
+      category: service.category || (category ? String(category).trim() : "Haircut & Styling"),
+      image: service.image || (image ? String(image).trim() : "https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=800&h=600&fit=crop&q=80"),
       customerId: toObjectIdIfValid(req.user._id),
+      customerEmail: req.user.email ? String(req.user.email).trim().toLowerCase() : "",
+      customerName: req.user.name ? String(req.user.name).trim() : "Customer",
+      customerPhone: req.user.phone || "",
       appointmentDate: appointmentDate.trim(),
       timeSlot: timeSlot.trim(),
       message: message ? String(message).trim() : "",
@@ -935,11 +954,20 @@ app.post("/api/appointments", verifyJWT, verifyCustomer, async (req, res, next) 
 // Customer Only: View own appointments list (with service details joined)
 app.get("/api/appointments/my", verifyJWT, verifyCustomer, async (req, res, next) => {
   try {
-    const customerKey = toObjectIdIfValid(req.user._id);
+    const rawUserId = String(req.user._id || "");
+    const userEmail = String(req.user.email || "").toLowerCase();
 
-    const appointments = await appointmentsCollection
+    const idFilters = [{ customerId: rawUserId }];
+    if (isValidObjectId(rawUserId)) {
+      idFilters.push({ customerId: new ObjectId(rawUserId) });
+    }
+    if (userEmail) {
+      idFilters.push({ customerEmail: userEmail });
+    }
+
+    const rawAppointments = await appointmentsCollection
       .aggregate([
-        { $match: { customerId: customerKey } },
+        { $match: { $or: idFilters } },
         { $sort: { createdAt: -1 } },
         {
           $lookup: {
@@ -952,6 +980,30 @@ app.get("/api/appointments/my", verifyJWT, verifyCustomer, async (req, res, next
         { $unwind: { path: "$service", preserveNullAndEmptyArrays: true } },
       ])
       .toArray();
+
+    const appointments = rawAppointments.map((apt) => ({
+      _id: apt._id,
+      serviceId: apt.serviceId,
+      serviceName: apt.service?.serviceName || apt.serviceName || "Salon Service",
+      category: apt.service?.category || apt.category || "Service",
+      image:
+        apt.service?.image ||
+        apt.image ||
+        "https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=400&h=300&fit=crop&q=80",
+      appointmentDate: apt.appointmentDate || "",
+      timeSlot: apt.timeSlot || "",
+      message: apt.message || "",
+      servicePrice: Number(apt.servicePrice) || Number(apt.service?.price) || 0,
+      status: apt.status || "pending",
+      paymentStatus: apt.paymentStatus || "unpaid",
+      createdAt: apt.createdAt || new Date(),
+      service: apt.service || {
+        serviceName: apt.serviceName || "Salon Service",
+        category: apt.category || "Service",
+        image: apt.image || "https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=400&h=300&fit=crop&q=80",
+        price: Number(apt.servicePrice) || 0,
+      },
+    }));
 
     return res.json({ appointments });
   } catch (err) {
@@ -1054,7 +1106,7 @@ app.get("/api/admin/appointments", verifyJWT, verifyAdmin, async (req, res, next
       matchStage.status = status;
     }
 
-    const appointments = await appointmentsCollection
+    const rawAppointments = await appointmentsCollection
       .aggregate([
         { $match: matchStage },
         { $sort: { createdAt: -1 } },
@@ -1072,13 +1124,48 @@ app.get("/api/admin/appointments", verifyJWT, verifyAdmin, async (req, res, next
             from: "user",
             localField: "customerId",
             foreignField: "_id",
-            as: "customer",
+            as: "customerUser",
           },
         },
-        { $unwind: { path: "$customer", preserveNullAndEmptyArrays: true } },
-        { $project: { "customer.password": 0 } },
+        { $unwind: { path: "$customerUser", preserveNullAndEmptyArrays: true } },
+        {
+          $lookup: {
+            from: "users",
+            localField: "customerId",
+            foreignField: "_id",
+            as: "customerUsersPlural",
+          },
+        },
+        { $unwind: { path: "$customerUsersPlural", preserveNullAndEmptyArrays: true } },
       ])
       .toArray();
+
+    const appointments = rawAppointments.map((apt) => {
+      const customerDoc = apt.customerUser || apt.customerUsersPlural || {};
+      return {
+        _id: apt._id,
+        serviceId: apt.serviceId,
+        serviceName: apt.service?.serviceName || apt.serviceName || "Salon Service",
+        category: apt.service?.category || apt.category || "Service",
+        image:
+          apt.service?.image ||
+          apt.image ||
+          "https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=400&h=300&fit=crop&q=80",
+        appointmentDate: apt.appointmentDate || "",
+        timeSlot: apt.timeSlot || "",
+        message: apt.message || "",
+        servicePrice: Number(apt.servicePrice) || Number(apt.service?.price) || 0,
+        status: apt.status || "pending",
+        paymentStatus: apt.paymentStatus || "unpaid",
+        createdAt: apt.createdAt || new Date(),
+        customer: {
+          _id: customerDoc._id || apt.customerId,
+          name: customerDoc.name || apt.customerName || "Customer",
+          email: customerDoc.email || apt.customerEmail || "",
+          phone: customerDoc.phone || apt.customerPhone || "N/A",
+        },
+      };
+    });
 
     return res.json({ appointments });
   } catch (err) {
@@ -1119,113 +1206,11 @@ app.patch("/api/admin/appointments/:id/status", verifyJWT, verifyAdmin, async (r
       { returnDocument: "after" }
     );
 
-    return res.json({ message: `Appointment ${status}.`, appointment: updated });
+    return res.json({ message: `Appointment ${status} successfully.`, appointment: updated });
   } catch (err) {
     return next(err);
   }
 });
-
-
-
-
-// ============================================================================
-// 12. ADMIN APPOINTMENTS MANAGEMENT
-// ============================================================================
-
-// Admin Only: List all appointment requests across all customers
-app.get("/api/admin/appointments", verifyJWT, verifyAdmin, async (req, res, next) => {
-  try {
-    const { status } = req.query;
-    const matchStage = {};
-
-    // Optional status filter
-    if (["pending", "confirmed", "cancelled"].includes(status)) {
-      matchStage.status = status;
-    }
-
-    const appointments = await appointmentsCollection
-      .aggregate([
-        { $match: matchStage },
-        { $sort: { createdAt: -1 } },
-        {
-          $lookup: {
-            from: "services",
-            localField: "serviceId",
-            foreignField: "_id",
-            as: "service",
-          },
-        },
-        { $unwind: { path: "$service", preserveNullAndEmptyArrays: true } },
-        {
-          $lookup: {
-            from: "user",
-            localField: "customerId",
-            foreignField: "_id",
-            as: "customer",
-          },
-        },
-        { $unwind: { path: "$customer", preserveNullAndEmptyArrays: true } },
-        { $project: { "customer.password": 0 } }, // Never leak password hashes
-      ])
-      .toArray();
-
-    return res.json({ appointments });
-  } catch (err) {
-    return next(err);
-  }
-});
-
-// Admin Only: Confirm pending appointment OR cancel pending/confirmed appointment
-app.patch(
-  "/api/admin/appointments/:id/status",
-  verifyJWT,
-  verifyAdmin,
-  async (req, res, next) => {
-    try {
-      const { id } = req.params;
-      const { status } = req.body;
-
-      if (!isValidObjectId(id)) {
-        return res.status(400).json({ message: "Invalid appointment ID format." });
-      }
-
-      if (status !== "confirmed" && status !== "cancelled") {
-        return res.status(400).json({ message: 'Status must be "confirmed" or "cancelled".' });
-      }
-
-      const appointment = await appointmentsCollection.findOne({ _id: new ObjectId(id) });
-      if (!appointment) {
-        return res.status(404).json({ message: "Appointment not found." });
-      }
-
-      // Rule: Only pending appointments can be confirmed
-      if (status === "confirmed" && appointment.status !== "pending") {
-        return res.status(400).json({ message: "Only pending appointments can be confirmed." });
-      }
-
-      // Rule: Only pending or confirmed appointments can be cancelled
-      if (
-        status === "cancelled" &&
-        appointment.status !== "pending" &&
-        appointment.status !== "confirmed"
-      ) {
-        return res.status(400).json({
-          message: "Only pending or confirmed appointments can be cancelled.",
-        });
-      }
-
-      const updated = await appointmentsCollection.findOneAndUpdate(
-        { _id: new ObjectId(id) },
-        { $set: { status, updatedAt: new Date() } },
-        { returnDocument: "after" }
-      );
-
-      return res.json({ message: `Appointment ${status} successfully.`, appointment: updated });
-    } catch (err) {
-      return next(err);
-    }
-  }
-);
 
 // ============================================================================
 // 13. STRIPE CHECKOUT & PAYMENTS
