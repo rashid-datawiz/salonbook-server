@@ -1,6 +1,5 @@
 # SalonBook — Backend API Server
 
-> **Assignment 9 — Category: 002**  
 > REST API Backend for the SalonBook Luxury Appointment Booking Platform.
 
 ---
@@ -22,27 +21,25 @@
 ### 2. Service Catalog Management
 - `GET /api/services`: Public active service listings with category filtering.
 - `GET /api/admin/services`: Admin catalog audit including inactive rituals.
-- `POST /api/services`: Create new ritual with price and duration validations.
 - `PATCH /api/services/:id`: Modify ritual information or toggle active status.
 - `DELETE /api/services/:id`: Remove service entry.
 
 ### 3. Appointment Booking System
-- `POST /api/appointments`: Authenticated customer appointment reservation with conflict prevention.
+- `POST /api/appointments`: Authenticated customer appointment reservation
 - `GET /api/appointments/my`: Customer-specific appointment ledger.
 - `PATCH /api/appointments/:id/cancel`: Customer cancellation of pending requests.
-- `GET /api/admin/appointments`: Administrative appointment overview with `$lookup` customer and service joins.
+- `GET /api/admin/appointments`: Administrative appointment overview 
 - `PATCH /api/admin/appointments/:id/status`: Admin status updates (`confirmed` or `cancelled`).
 
 ### 4. Stripe Checkout & Immutable Financial Ledger
 - `POST /api/payments/create-checkout-session`: Generates hosted Stripe Checkout sessions with verified appointment metadata.
-- `POST /api/payments/webhook`: Raw-body Stripe webhook receiver validating signatures (`stripe.webhooks.constructEvent`). Listens for `checkout.session.completed` to atomically mark appointments as `paid` and upsert immutable records into `transactions`.
+- `POST /api/payments/webhook`: Stripe webhook receiver validating signatures 
 - `GET /api/payments/verify-session/:sessionId`: Direct session verification for return redirects.
 - `GET /api/admin/transactions`: Read-only financial ledger aggregating transaction history with customers, appointments, and services. Manual financial edits are strictly disallowed.
 - `GET /api/transactions/my`: Customer personal transaction history.
 
 ### 5. Registered Customer Directory
 - `GET /api/admin/users`: Audit all registered customer profiles.
-- `PATCH /api/admin/users/:id/block`: Admin toggle to block or restore customer platform access.
 
 ---
 
